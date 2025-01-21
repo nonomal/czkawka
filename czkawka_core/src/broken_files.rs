@@ -16,13 +16,14 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
-    check_if_stop_received, create_crash_message, prepare_thread_handler_common, send_info_and_wait_for_ending_all_threads, AUDIO_FILES_EXTENSIONS,
+    check_if_stop_received, create_crash_message, prepare_thread_handler_common, send_info_and_wait_for_ending_all_threads, WorkContinueStatus, AUDIO_FILES_EXTENSIONS,
     IMAGE_RS_BROKEN_FILES_EXTENSIONS, PDF_FILES_EXTENSIONS, ZIP_FILES_EXTENSIONS,
 };
-use crate::common_cache::{get_broken_files_cache_file, load_cache_from_file_generalized_by_path, save_cache_to_file_generalized};
-use crate::common_dir_traversal::{CheckingMethod, DirTraversalBuilder, DirTraversalResult, FileEntry, ProgressData, ToolType};
+use crate::common_cache::{extract_loaded_cache, get_broken_files_cache_file, load_cache_from_file_generalized_by_path, save_cache_to_file_generalized};
+use crate::common_dir_traversal::{DirTraversalBuilder, DirTraversalResult, FileEntry, ToolType};
 use crate::common_tool::{CommonData, CommonToolData, DeleteMethod};
 use crate::common_traits::*;
+use crate::progress_data::{CurrentStage, ProgressData};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct BrokenEntry {
@@ -66,10 +67,8 @@ pub enum TypeOfFile {
     PDF,
 }
 
-const MAX_BROKEN_FILES_STAGE: u8 = 1;
-
 bitflags! {
-    #[derive(PartialEq, Copy, Clone)]
+    #[derive(PartialEq, Copy, Clone, Debug)]
     pub struct CheckedTypes : u32 {
         const NONE = 0;
 
@@ -85,33 +84,43 @@ pub struct Info {
     pub number_of_broken_files: usize,
 }
 
+pub struct BrokenFilesParameters {
+    pub checked_types: CheckedTypes,
+}
+
+impl BrokenFilesParameters {
+    pub fn new(checked_types: CheckedTypes) -> Self {
+        Self { checked_types }
+    }
+}
+
 pub struct BrokenFiles {
     common_data: CommonToolData,
     information: Info,
     files_to_check: BTreeMap<String, BrokenEntry>,
     broken_files: Vec<BrokenEntry>,
-    checked_types: CheckedTypes,
+    params: BrokenFilesParameters,
 }
 
 impl BrokenFiles {
-    pub fn new() -> Self {
+    pub fn new(params: BrokenFilesParameters) -> Self {
         Self {
             common_data: CommonToolData::new(ToolType::BrokenFiles),
             information: Info::default(),
             files_to_check: Default::default(),
             broken_files: Default::default(),
-            checked_types: CheckedTypes::PDF | CheckedTypes::AUDIO | CheckedTypes::IMAGE | CheckedTypes::ARCHIVE,
+            params,
         }
     }
 
     #[fun_time(message = "find_broken_files", level = "info")]
     pub fn find_broken_files(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) {
         self.prepare_items();
-        if !self.check_files(stop_receiver, progress_sender) {
+        if self.check_files(stop_receiver, progress_sender) == WorkContinueStatus::Stop {
             self.common_data.stopped_search = true;
             return;
         }
-        if !self.look_for_broken_files(stop_receiver, progress_sender) {
+        if self.look_for_broken_files(stop_receiver, progress_sender) == WorkContinueStatus::Stop {
             self.common_data.stopped_search = true;
             return;
         }
@@ -120,7 +129,7 @@ impl BrokenFiles {
     }
 
     #[fun_time(message = "check_files", level = "debug")]
-    fn check_files(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> bool {
+    fn check_files(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> WorkContinueStatus {
         let zip_extensions = ZIP_FILES_EXTENSIONS.iter().collect::<HashSet<_>>();
         let audio_extensions = AUDIO_FILES_EXTENSIONS.iter().collect::<HashSet<_>>();
         let pdf_extensions = PDF_FILES_EXTENSIONS.iter().collect::<HashSet<_>>();
@@ -134,14 +143,16 @@ impl BrokenFiles {
             (CheckedTypes::IMAGE, IMAGE_RS_BROKEN_FILES_EXTENSIONS),
         ];
         for (checked_type, extensions_to_add) in &vec_extensions {
-            if self.checked_types.contains(*checked_type) {
+            if self.get_params().checked_types.contains(*checked_type) {
                 extensions.extend_from_slice(extensions_to_add);
             }
         }
 
         self.common_data.extensions.set_and_validate_allowed_extensions(&extensions);
+        // TODO, responsibility should be moved to CLI/GUI
+        // assert!(self.common_data.extensions.set_any_extensions(), "This should be checked before");
         if !self.common_data.extensions.set_any_extensions() {
-            return true;
+            return WorkContinueStatus::Continue;
         }
 
         let result = DirTraversalBuilder::new()
@@ -149,7 +160,6 @@ impl BrokenFiles {
             .stop_receiver(stop_receiver)
             .progress_sender(progress_sender)
             .common_data(&self.common_data)
-            .max_stage(MAX_BROKEN_FILES_STAGE)
             .build()
             .run();
 
@@ -166,10 +176,10 @@ impl BrokenFiles {
                     .collect();
                 self.common_data.text_messages.warnings.extend(warnings);
                 debug!("check_files - Found {} files to check.", self.files_to_check.len());
-                true
+                WorkContinueStatus::Continue
             }
 
-            DirTraversalResult::Stopped => false,
+            DirTraversalResult::Stopped => WorkContinueStatus::Stop,
         }
     }
 
@@ -236,7 +246,7 @@ impl BrokenFiles {
                     for idx in 0..file.num_pages() {
                         if let Err(e) = file.get_page(idx) {
                             let err = validate_pdf_error(&mut file_entry, e);
-                            if let PdfError::InvalidPassword = err {
+                            if matches!(err, PdfError::InvalidPassword) {
                                 return None;
                             }
                             break;
@@ -248,7 +258,7 @@ impl BrokenFiles {
                         return None;
                     }
                     let err = validate_pdf_error(&mut file_entry, e);
-                    if let PdfError::InvalidPassword = err {
+                    if matches!(err, PdfError::InvalidPassword) {
                         return None;
                     }
                 }
@@ -277,13 +287,7 @@ impl BrokenFiles {
             self.get_text_messages_mut().extend_with_another_messages(messages);
             loaded_hash_map = loaded_items.unwrap_or_default();
 
-            for (name, file_entry) in files_to_check {
-                if let Some(cached_file_entry) = loaded_hash_map.get(&name) {
-                    records_already_cached.insert(name, cached_file_entry.clone());
-                } else {
-                    non_cached_files_to_check.insert(name, file_entry);
-                }
-            }
+            extract_loaded_cache(&loaded_hash_map, files_to_check, &mut records_already_cached, &mut non_cached_files_to_check);
         } else {
             loaded_hash_map = Default::default();
             non_cached_files_to_check = files_to_check;
@@ -292,11 +296,15 @@ impl BrokenFiles {
     }
 
     #[fun_time(message = "look_for_broken_files", level = "debug")]
-    fn look_for_broken_files(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> bool {
+    fn look_for_broken_files(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> WorkContinueStatus {
+        if self.files_to_check.is_empty() {
+            return WorkContinueStatus::Continue;
+        }
+
         let (loaded_hash_map, records_already_cached, non_cached_files_to_check) = self.load_cache();
 
         let (progress_thread_handle, progress_thread_run, atomic_counter, _check_was_stopped) =
-            prepare_thread_handler_common(progress_sender, 1, 1, non_cached_files_to_check.len(), CheckingMethod::None, self.common_data.tool_type);
+            prepare_thread_handler_common(progress_sender, CurrentStage::BrokenFilesChecking, non_cached_files_to_check.len(), self.get_test_type());
 
         debug!("look_for_broken_files - started finding for broken files");
         let mut vec_file_entry: Vec<BrokenEntry> = non_cached_files_to_check
@@ -317,8 +325,7 @@ impl BrokenFiles {
                 }
             })
             .while_some()
-            .filter(Option::is_some)
-            .map(Option::unwrap)
+            .flatten()
             .collect::<Vec<BrokenEntry>>();
         debug!("look_for_broken_files - ended finding for broken files");
 
@@ -329,17 +336,14 @@ impl BrokenFiles {
 
         self.save_to_cache(&vec_file_entry, loaded_hash_map);
 
-        self.broken_files = vec_file_entry
-            .into_par_iter()
-            .filter_map(|f| if f.error_string.is_empty() { None } else { Some(f) })
-            .collect();
+        self.broken_files = vec_file_entry.into_iter().filter_map(|f| if f.error_string.is_empty() { None } else { Some(f) }).collect();
 
         self.information.number_of_broken_files = self.broken_files.len();
         debug!("Found {} broken files.", self.information.number_of_broken_files);
         // Clean unused data
         self.files_to_check = Default::default();
 
-        true
+        WorkContinueStatus::Continue
     }
     #[fun_time(message = "save_to_cache", level = "debug")]
     fn save_to_cache(&mut self, vec_file_entry: &[BrokenEntry], loaded_hash_map: BTreeMap<String, BrokenEntry>) {
@@ -384,17 +388,12 @@ impl BrokenFiles {
         &self.broken_files
     }
 
-    pub fn set_checked_types(&mut self, checked_types: CheckedTypes) {
-        self.checked_types = checked_types;
+    pub fn get_params(&self) -> &BrokenFilesParameters {
+        &self.params
     }
 
     pub const fn get_information(&self) -> &Info {
         &self.information
-    }
-}
-impl Default for BrokenFiles {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -420,7 +419,7 @@ impl PrintResults for BrokenFiles {
         if !self.broken_files.is_empty() {
             writeln!(writer, "Found {} broken files.", self.information.number_of_broken_files)?;
             for file_entry in &self.broken_files {
-                writeln!(writer, "{:?} - {}", file_entry.path, file_entry.error_string)?;
+                writeln!(writer, "\"{}\" - {}", file_entry.path.to_string_lossy(), file_entry.error_string)?;
             }
         } else {
             write!(writer, "Not found any broken files.")?;
@@ -461,7 +460,7 @@ fn check_extension_availability(
     } else if pdf_extensions.contains(&extension_lowercase.as_str()) {
         TypeOfFile::PDF
     } else {
-        eprintln!("File with unknown extension: {full_name:?} - {extension_lowercase}");
+        eprintln!("File with unknown extension: \"{}\" - {extension_lowercase}", full_name.to_string_lossy());
         debug_assert!(false, "File with unknown extension");
         TypeOfFile::Unknown
     }

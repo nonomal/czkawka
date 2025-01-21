@@ -7,9 +7,11 @@ use fun_time::fun_time;
 use log::debug;
 use serde::{Deserialize, Serialize};
 
-use crate::common_dir_traversal::{Collect, DirTraversalBuilder, DirTraversalResult, ErrorType, FileEntry, ProgressData, ToolType};
+use crate::common::WorkContinueStatus;
+use crate::common_dir_traversal::{Collect, DirTraversalBuilder, DirTraversalResult, ErrorType, FileEntry, ToolType};
 use crate::common_tool::{CommonData, CommonToolData, DeleteMethod};
 use crate::common_traits::*;
+use crate::progress_data::ProgressData;
 
 #[derive(Default)]
 pub struct Info {
@@ -73,7 +75,7 @@ impl InvalidSymlinks {
     #[fun_time(message = "find_invalid_links", level = "info")]
     pub fn find_invalid_links(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) {
         self.prepare_items();
-        if !self.check_files(stop_receiver, progress_sender) {
+        if self.check_files(stop_receiver, progress_sender) == WorkContinueStatus::Stop {
             self.common_data.stopped_search = true;
             return;
         }
@@ -82,7 +84,7 @@ impl InvalidSymlinks {
     }
 
     #[fun_time(message = "check_files", level = "debug")]
-    fn check_files(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> bool {
+    fn check_files(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> WorkContinueStatus {
         let result = DirTraversalBuilder::new()
             .common_data(&self.common_data)
             .group_by(|_fe| ())
@@ -98,18 +100,16 @@ impl InvalidSymlinks {
                     .into_values()
                     .flatten()
                     .filter_map(|e| {
-                        let Some((destination_path, type_of_error)) = Self::check_invalid_symlinks(&e.path) else {
-                            return None;
-                        };
+                        let (destination_path, type_of_error) = Self::check_invalid_symlinks(&e.path)?;
                         Some(e.into_symlinks_entry(SymlinkInfo { destination_path, type_of_error }))
                     })
                     .collect();
                 self.information.number_of_invalid_symlinks = self.invalid_symlinks.len();
                 self.common_data.text_messages.warnings.extend(warnings);
                 debug!("Found {} invalid symlinks.", self.information.number_of_invalid_symlinks);
-                true
+                WorkContinueStatus::Continue
             }
-            DirTraversalResult::Stopped => false,
+            DirTraversalResult::Stopped => WorkContinueStatus::Stop,
         }
     }
 
@@ -194,9 +194,9 @@ impl PrintResults for InvalidSymlinks {
             for file_entry in &self.invalid_symlinks {
                 writeln!(
                     writer,
-                    "{:?}\t\t{:?}\t\t{}",
-                    file_entry.path,
-                    file_entry.symlink_info.destination_path,
+                    "\"{}\"\t\t\"{}\"\t\t{}",
+                    file_entry.path.to_string_lossy(),
+                    file_entry.symlink_info.destination_path.to_string_lossy(),
                     match file_entry.symlink_info.type_of_error {
                         ErrorType::InfiniteRecursion => "Infinite Recursion",
                         ErrorType::NonExistentFile => "Non Existent File",

@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::SystemTime;
+use std::time::Instant;
 use std::{mem, panic};
 
 use bk_tree::BKTree;
 use crossbeam_channel::{Receiver, Sender};
 use fun_time::fun_time;
+use hamming_bitwise_fast::hamming_bitwise_fast;
 use humansize::{format_size, BINARY};
 use image::GenericImageView;
 use image_hasher::{FilterType, HashAlg, HasherConfig};
@@ -15,22 +16,25 @@ use log::debug;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "heif")]
-use crate::common::get_dynamic_image_from_heic;
 use crate::common::{
-    check_if_stop_received, create_crash_message, delete_files_custom, get_dynamic_image_from_raw_image, prepare_thread_handler_common, send_info_and_wait_for_ending_all_threads,
-    HEIC_EXTENSIONS, IMAGE_RS_SIMILAR_IMAGES_EXTENSIONS, RAW_IMAGE_EXTENSIONS,
+    check_if_stop_received, delete_files_custom, prepare_thread_handler_common, send_info_and_wait_for_ending_all_threads, WorkContinueStatus, HEIC_EXTENSIONS,
+    IMAGE_RS_SIMILAR_IMAGES_EXTENSIONS, JXL_IMAGE_EXTENSIONS, RAW_IMAGE_EXTENSIONS,
 };
-use crate::common_cache::{get_similar_images_cache_file, load_cache_from_file_generalized_by_path, save_cache_to_file_generalized};
-use crate::common_dir_traversal::{inode, take_1_per_inode, CheckingMethod, DirTraversalBuilder, DirTraversalResult, FileEntry, ProgressData, ToolType};
+use crate::common_cache::{extract_loaded_cache, get_similar_images_cache_file, load_cache_from_file_generalized_by_path, save_cache_to_file_generalized};
+use crate::common_dir_traversal::{inode, take_1_per_inode, DirTraversalBuilder, DirTraversalResult, FileEntry, ToolType};
+use crate::common_image::get_dynamic_image_from_path;
 use crate::common_tool::{CommonData, CommonToolData, DeleteMethod};
 use crate::common_traits::{DebugPrint, PrintResults, ResultEntry};
 use crate::flc;
+use crate::progress_data::{CurrentStage, ProgressData};
 
 type ImHash = Vec<u8>;
 
+// 40 is, similar like previous 20 in 8 hash size is useless
+// But since Krowka have problems with proper changing max value in fly
+// hardcode 40 as max value
 pub const SIMILAR_VALUES: [[u32; 6]; 4] = [
-    [1, 2, 5, 7, 14, 20],    // 8
+    [1, 2, 5, 7, 14, 40],    // 8
     [2, 5, 15, 30, 40, 40],  // 16
     [4, 10, 20, 40, 40, 40], // 32
     [6, 20, 40, 40, 40, 40], // 64
@@ -45,7 +49,6 @@ pub struct ImagesEntry {
     pub modified_date: u64,
     pub hash: ImHash,
     pub similarity: u32,
-    pub image_type: ImageType,
 }
 
 impl ResultEntry for ImagesEntry {
@@ -70,20 +73,9 @@ impl FileEntry {
             height: 0,
             hash: Vec::new(),
             similarity: 0,
-            image_type: ImageType::Unknown,
         }
     }
 }
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ImageType {
-    Normal,
-    Raw,
-    Heic,
-    Unknown,
-}
-
-const MAX_IMAGE_STAGE: u8 = 2;
 
 #[derive(Clone, Debug, Copy)]
 pub enum SimilarityPreset {
@@ -101,11 +93,34 @@ struct Hamming;
 
 impl bk_tree::Metric<ImHash> for Hamming {
     fn distance(&self, a: &ImHash, b: &ImHash) -> u32 {
-        hamming::distance_fast(a, b).unwrap() as u32
+        hamming_bitwise_fast(a, b)
     }
 
     fn threshold_distance(&self, a: &ImHash, b: &ImHash, _threshold: u32) -> Option<u32> {
         Some(self.distance(a, b))
+    }
+}
+
+pub struct SimilarImagesParameters {
+    pub similarity: u32,
+    pub hash_size: u8,
+    pub hash_alg: HashAlg,
+    pub image_filter: FilterType,
+    pub exclude_images_with_same_size: bool,
+    pub ignore_hard_links: bool,
+}
+
+impl SimilarImagesParameters {
+    pub fn new(similarity: u32, hash_size: u8, hash_alg: HashAlg, image_filter: FilterType, exclude_images_with_same_size: bool, ignore_hard_links: bool) -> Self {
+        assert!([8, 16, 32, 64].contains(&hash_size));
+        Self {
+            similarity,
+            hash_size,
+            hash_alg,
+            image_filter,
+            exclude_images_with_same_size,
+            ignore_hard_links,
+        }
     }
 }
 
@@ -117,13 +132,8 @@ pub struct SimilarImages {
     similar_referenced_vectors: Vec<(ImagesEntry, Vec<ImagesEntry>)>,
     // Hashmap with image hashes and Vector with names of files
     image_hashes: HashMap<ImHash, Vec<ImagesEntry>>,
-    similarity: u32,
     images_to_check: BTreeMap<String, ImagesEntry>,
-    hash_size: u8,
-    hash_alg: HashAlg,
-    image_filter: FilterType,
-    exclude_images_with_same_size: bool,
-    ignore_hard_links: bool,
+    params: SimilarImagesParameters,
 }
 
 #[derive(Default)]
@@ -133,21 +143,16 @@ pub struct Info {
 }
 
 impl SimilarImages {
-    pub fn new() -> Self {
+    pub fn new(params: SimilarImagesParameters) -> Self {
         Self {
             common_data: CommonToolData::new(ToolType::SimilarImages),
             information: Default::default(),
             bktree: BKTree::new(Hamming),
             similar_vectors: vec![],
-            similar_referenced_vectors: Default::default(),
-            image_hashes: Default::default(),
-            similarity: 0,
+            similar_referenced_vectors: vec![],
+            params,
             images_to_check: Default::default(),
-            hash_size: 8,
-            hash_alg: HashAlg::Gradient,
-            image_filter: FilterType::Lanczos3,
-            exclude_images_with_same_size: false,
-            ignore_hard_links: false,
+            image_hashes: Default::default(),
         }
     }
 
@@ -155,15 +160,15 @@ impl SimilarImages {
     pub fn find_similar_images(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) {
         self.prepare_items();
         self.common_data.use_reference_folders = !self.common_data.directories.reference_directories.is_empty();
-        if !self.check_for_similar_images(stop_receiver, progress_sender) {
+        if self.check_for_similar_images(stop_receiver, progress_sender) == WorkContinueStatus::Stop {
             self.common_data.stopped_search = true;
             return;
         }
-        if !self.hash_images(stop_receiver, progress_sender) {
+        if self.hash_images(stop_receiver, progress_sender) == WorkContinueStatus::Stop {
             self.common_data.stopped_search = true;
             return;
         }
-        if !self.find_similar_hashes(stop_receiver, progress_sender) {
+        if self.find_similar_hashes(stop_receiver, progress_sender) == WorkContinueStatus::Stop {
             self.common_data.stopped_search = true;
             return;
         }
@@ -171,31 +176,27 @@ impl SimilarImages {
         self.debug_print();
     }
 
-    // #[fun_time(message = "check_for_similar_images", level = "debug")]
-    fn check_for_similar_images(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> bool {
+    #[fun_time(message = "check_for_similar_images", level = "debug")]
+    fn check_for_similar_images(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> WorkContinueStatus {
         if cfg!(feature = "heif") {
             self.common_data
                 .extensions
-                .set_and_validate_allowed_extensions(&[IMAGE_RS_SIMILAR_IMAGES_EXTENSIONS, RAW_IMAGE_EXTENSIONS, HEIC_EXTENSIONS].concat());
+                .set_and_validate_allowed_extensions(&[IMAGE_RS_SIMILAR_IMAGES_EXTENSIONS, RAW_IMAGE_EXTENSIONS, JXL_IMAGE_EXTENSIONS, HEIC_EXTENSIONS].concat());
         } else {
             self.common_data
                 .extensions
-                .set_and_validate_allowed_extensions(&[IMAGE_RS_SIMILAR_IMAGES_EXTENSIONS, RAW_IMAGE_EXTENSIONS].concat());
-        }
-        if !self.common_data.extensions.set_any_extensions() {
-            return true;
+                .set_and_validate_allowed_extensions(&[IMAGE_RS_SIMILAR_IMAGES_EXTENSIONS, RAW_IMAGE_EXTENSIONS, JXL_IMAGE_EXTENSIONS].concat());
         }
 
-        let normal_image_extensions = IMAGE_RS_SIMILAR_IMAGES_EXTENSIONS.iter().collect::<HashSet<_>>();
-        let raw_image_extensions = RAW_IMAGE_EXTENSIONS.iter().collect::<HashSet<_>>();
-        let heic_extensions = HEIC_EXTENSIONS.iter().collect::<HashSet<_>>();
+        if !self.common_data.extensions.set_any_extensions() {
+            return WorkContinueStatus::Continue;
+        }
 
         let result = DirTraversalBuilder::new()
             .group_by(inode)
             .stop_receiver(stop_receiver)
             .progress_sender(progress_sender)
             .common_data(&self.common_data)
-            .max_stage(MAX_IMAGE_STAGE)
             .build()
             .run();
 
@@ -203,27 +204,20 @@ impl SimilarImages {
             DirTraversalResult::SuccessFiles { grouped_file_entries, warnings } => {
                 self.images_to_check = grouped_file_entries
                     .into_iter()
-                    .flat_map(if self.ignore_hard_links { |(_, fes)| fes } else { take_1_per_inode })
+                    .flat_map(if self.get_params().ignore_hard_links { |(_, fes)| fes } else { take_1_per_inode })
                     .map(|fe| {
                         let fe_str = fe.path.to_string_lossy().to_string();
-                        let extension_lowercase = fe.path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
-                        let mut image_entry = fe.into_images_entry();
-                        if normal_image_extensions.contains(&extension_lowercase.as_str()) {
-                            image_entry.image_type = ImageType::Normal;
-                        } else if raw_image_extensions.contains(&extension_lowercase.as_str()) {
-                            image_entry.image_type = ImageType::Raw;
-                        } else if heic_extensions.contains(&extension_lowercase.as_str()) {
-                            image_entry.image_type = ImageType::Heic;
-                        }
+                        let image_entry = fe.into_images_entry();
+
                         (fe_str, image_entry)
                     })
                     .collect();
                 self.common_data.text_messages.warnings.extend(warnings);
                 debug!("check_files - Found {} image files.", self.images_to_check.len());
-                true
+                WorkContinueStatus::Continue
             }
 
-            DirTraversalResult::Stopped => false,
+            DirTraversalResult::Stopped => WorkContinueStatus::Stop,
         }
     }
 
@@ -236,7 +230,7 @@ impl SimilarImages {
 
         if self.common_data.use_cache {
             let (messages, loaded_items) = load_cache_from_file_generalized_by_path::<ImagesEntry>(
-                &get_similar_images_cache_file(&self.hash_size, &self.hash_alg, &self.image_filter),
+                &get_similar_images_cache_file(&self.get_params().hash_size, &self.get_params().hash_alg, &self.get_params().image_filter),
                 self.get_delete_outdated_cache(),
                 &self.images_to_check,
             );
@@ -244,13 +238,12 @@ impl SimilarImages {
             loaded_hash_map = loaded_items.unwrap_or_default();
 
             debug!("hash_images-load_cache - starting calculating diff");
-            for (name, file_entry) in mem::take(&mut self.images_to_check) {
-                if let Some(cached_file_entry) = loaded_hash_map.get(&name) {
-                    records_already_cached.insert(name, cached_file_entry.clone());
-                } else {
-                    non_cached_files_to_check.insert(name, file_entry);
-                }
-            }
+            extract_loaded_cache(
+                &loaded_hash_map,
+                mem::take(&mut self.images_to_check),
+                &mut records_already_cached,
+                &mut non_cached_files_to_check,
+            );
             debug!(
                 "hash_images_load_cache - completed diff between loaded and prechecked files, {}({}) - non cached, {}({}) - already cached",
                 non_cached_files_to_check.len(),
@@ -273,20 +266,22 @@ impl SimilarImages {
     // - Join all hashes and save it to file
 
     #[fun_time(message = "hash_images", level = "debug")]
-    fn hash_images(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> bool {
+    fn hash_images(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> WorkContinueStatus {
+        if self.images_to_check.is_empty() {
+            return WorkContinueStatus::Continue;
+        }
+
         let (loaded_hash_map, records_already_cached, non_cached_files_to_check) = self.hash_images_load_cache();
 
-        let (progress_thread_handle, progress_thread_run, atomic_counter, check_was_stopped) =
-            prepare_thread_handler_common(progress_sender, 1, 2, non_cached_files_to_check.len(), CheckingMethod::None, self.common_data.tool_type);
-
-        // Throw out images with not proper type - TODO why this happens, only broken cache?
-        let non_cached_files_to_check = non_cached_files_to_check
-            .into_iter()
-            .filter(|(_, file_entry)| file_entry.image_type != ImageType::Unknown)
-            .collect::<BTreeMap<_, _>>();
+        let (progress_thread_handle, progress_thread_run, atomic_counter, check_was_stopped) = prepare_thread_handler_common(
+            progress_sender,
+            CurrentStage::SimilarImagesCalculatingHashes,
+            non_cached_files_to_check.len(),
+            self.get_test_type(),
+        );
 
         debug!("hash_images - start hashing images");
-        let mut vec_file_entry: Vec<ImagesEntry> = non_cached_files_to_check
+        let (mut vec_file_entry, errors): (Vec<ImagesEntry>, Vec<String>) = non_cached_files_to_check
             .into_par_iter()
             .map(|(_s, mut file_entry)| {
                 atomic_counter.fetch_add(1, Ordering::Relaxed);
@@ -294,13 +289,19 @@ impl SimilarImages {
                     check_was_stopped.store(true, Ordering::Relaxed);
                     return None;
                 }
-                self.collect_image_file_entry(&mut file_entry);
+                if let Err(e) = self.collect_image_file_entry(&mut file_entry) {
+                    return Some(Err(e));
+                }
 
-                Some(Some(file_entry))
+                Some(Ok(file_entry))
             })
             .while_some()
-            .filter_map(|e| e)
-            .collect::<Vec<ImagesEntry>>();
+            .partition_map(|res| match res {
+                Ok(entry) => itertools::Either::Left(entry),
+                Err(err) => itertools::Either::Right(err),
+            });
+
+        self.common_data.text_messages.errors.extend(errors);
         debug!("hash_images - end hashing {} images", vec_file_entry.len());
 
         send_info_and_wait_for_ending_all_threads(&progress_thread_run, progress_thread_handle);
@@ -322,10 +323,10 @@ impl SimilarImages {
 
         // Break if stop was clicked after saving to cache
         if check_was_stopped.load(Ordering::Relaxed) {
-            return false;
+            return WorkContinueStatus::Stop;
         }
 
-        true
+        WorkContinueStatus::Continue
     }
 
     #[fun_time(message = "save_to_cache", level = "debug")]
@@ -338,7 +339,7 @@ impl SimilarImages {
             }
 
             let messages = save_cache_to_file_generalized(
-                &get_similar_images_cache_file(&self.hash_size, &self.hash_alg, &self.image_filter),
+                &get_similar_images_cache_file(&self.get_params().hash_size, &self.get_params().hash_alg, &self.get_params().image_filter),
                 &all_results,
                 self.common_data.save_also_as_json,
                 0,
@@ -347,59 +348,8 @@ impl SimilarImages {
         }
     }
 
-    fn collect_image_file_entry(&self, file_entry: &mut ImagesEntry) {
-        let img;
-
-        if file_entry.image_type == ImageType::Heic {
-            #[cfg(feature = "heif")]
-            {
-                img = match get_dynamic_image_from_heic(&file_entry.path.to_string_lossy()) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        return;
-                    }
-                };
-            }
-            #[cfg(not(feature = "heif"))]
-            {
-                if let Ok(image_result) = panic::catch_unwind(|| image::open(&file_entry.path)) {
-                    if let Ok(image2) = image_result {
-                        img = image2;
-                    } else {
-                        return;
-                    }
-                } else {
-                    let message = crate::common::create_crash_message("Image-rs", &file_entry.path.to_string_lossy(), "https://github.com/image-rs/image/issues");
-                    println!("{message}");
-                    return;
-                }
-            }
-        } else {
-            match file_entry.image_type {
-                ImageType::Normal | ImageType::Heic => {
-                    if let Ok(image_result) = panic::catch_unwind(|| image::open(&file_entry.path)) {
-                        if let Ok(image2) = image_result {
-                            img = image2;
-                        } else {
-                            return;
-                        }
-                    } else {
-                        let message = create_crash_message("Image-rs", &file_entry.path.to_string_lossy(), "https://github.com/image-rs/image/issues");
-                        println!("{message}");
-                        return;
-                    }
-                }
-                ImageType::Raw => {
-                    img = match get_dynamic_image_from_raw_image(&file_entry.path) {
-                        Some(t) => t,
-                        None => return,
-                    };
-                }
-                _ => {
-                    unreachable!();
-                }
-            }
-        }
+    fn collect_image_file_entry(&self, file_entry: &mut ImagesEntry) -> Result<(), String> {
+        let img = get_dynamic_image_from_path(&file_entry.path.to_string_lossy())?;
 
         let dimensions = img.dimensions();
 
@@ -407,13 +357,14 @@ impl SimilarImages {
         file_entry.height = dimensions.1;
 
         let hasher_config = HasherConfig::new()
-            .hash_size(self.hash_size as u32, self.hash_size as u32)
-            .hash_alg(self.hash_alg)
-            .resize_filter(self.image_filter);
+            .hash_size(self.get_params().hash_size as u32, self.get_params().hash_size as u32)
+            .hash_alg(self.get_params().hash_alg)
+            .resize_filter(self.get_params().image_filter);
         let hasher = hasher_config.to_hasher();
-
         let hash = hasher.hash_image(&img);
         file_entry.hash = hash.as_bytes().to_vec();
+
+        Ok(())
     }
 
     // Split hashes at 2 parts, base hashes and hashes to compare, 3 argument is set of hashes with multiple images
@@ -482,7 +433,10 @@ impl SimilarImages {
             for fe in &mut vec_fe {
                 fe.similarity = similarity;
             }
-            collected_similar_images.get_mut(&parent_hash).unwrap().append(&mut vec_fe);
+            collected_similar_images
+                .get_mut(&parent_hash)
+                .expect("Cannot find parent hash - this should be added in previous step")
+                .append(&mut vec_fe);
         }
     }
 
@@ -494,12 +448,12 @@ impl SimilarImages {
         progress_sender: Option<&Sender<ProgressData>>,
         stop_receiver: Option<&Receiver<()>>,
         tolerance: u32,
-    ) -> bool {
+    ) -> WorkContinueStatus {
         // Don't use hashes with multiple images in bktree, because they will always be master of group and cannot be find by other hashes
         let (base_hashes, hashes_with_multiple_images) = self.split_hashes(all_hashed_images);
 
         let (progress_thread_handle, progress_thread_run, atomic_counter, check_was_stopped) =
-            prepare_thread_handler_common(progress_sender, 2, 2, base_hashes.len(), CheckingMethod::None, self.common_data.tool_type);
+            prepare_thread_handler_common(progress_sender, CurrentStage::SimilarImagesComparingHashes, base_hashes.len(), self.get_test_type());
 
         let mut hashes_parents: HashMap<ImHash, u32> = Default::default(); // Hashes used as parent (hash, children_number_of_hash)
         let mut hashes_similarity: HashMap<ImHash, (ImHash, u32)> = Default::default(); // Hashes used as child, (parent_hash, similarity)
@@ -549,7 +503,7 @@ impl SimilarImages {
 
             if check_was_stopped.load(Ordering::Relaxed) {
                 send_info_and_wait_for_ending_all_threads(&progress_thread_run, progress_thread_handle);
-                return false;
+                return WorkContinueStatus::Stop;
             }
 
             self.connect_results(partial_results, &mut hashes_parents, &mut hashes_similarity, &hashes_with_multiple_images);
@@ -560,7 +514,7 @@ impl SimilarImages {
         debug_check_for_duplicated_things(self.common_data.use_reference_folders, &hashes_parents, &hashes_similarity, all_hashed_images, "LATTER");
         self.collect_hash_compare_result(hashes_parents, &hashes_with_multiple_images, all_hashed_images, collected_similar_images, hashes_similarity);
 
-        true
+        WorkContinueStatus::Continue
     }
 
     #[fun_time(message = "connect_results", level = "debug")]
@@ -590,11 +544,13 @@ impl SimilarImages {
                     if *current_similarity_with_parent > similarity {
                         need_to_check = true;
 
-                        *hashes_parents.get_mut(current_parent_hash).unwrap() -= 1;
+                        *hashes_parents.get_mut(current_parent_hash).expect("Cannot find parent hash") -= 1;
                         if hashes_parents.get(current_parent_hash) == Some(&0) && !hashes_with_multiple_images.contains(current_parent_hash) {
                             hashes_parents.remove(current_parent_hash);
                         }
-                        hashes_similarity.remove(original_hash).unwrap();
+                        hashes_similarity
+                            .remove(original_hash)
+                            .expect("This should never fail, because we are iterating over this hash");
                     }
                 } else {
                     need_to_check = true;
@@ -604,7 +560,7 @@ impl SimilarImages {
                     if let Some((other_parent_hash, other_similarity)) = hashes_similarity.get(compared_hash) {
                         if *other_similarity > similarity {
                             need_to_add = true;
-                            *hashes_parents.get_mut(other_parent_hash).unwrap() -= 1;
+                            *hashes_parents.get_mut(other_parent_hash).expect("Cannot find parent hash") -= 1;
                         }
                     }
                     // But when there is no record, just add it
@@ -626,12 +582,12 @@ impl SimilarImages {
     }
 
     #[fun_time(message = "find_similar_hashes", level = "debug")]
-    fn find_similar_hashes(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> bool {
+    fn find_similar_hashes(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> WorkContinueStatus {
         if self.image_hashes.is_empty() {
-            return true;
+            return WorkContinueStatus::Continue;
         }
 
-        let tolerance = self.similarity;
+        let tolerance = self.get_params().similarity;
 
         // Results
         let mut collected_similar_images: HashMap<ImHash, Vec<ImagesEntry>> = Default::default();
@@ -645,8 +601,10 @@ impl SimilarImages {
                     collected_similar_images.insert(hash, vec_file_entry);
                 }
             }
-        } else if !self.compare_hashes_with_non_zero_tolerance(&all_hashed_images, &mut collected_similar_images, progress_sender, stop_receiver, tolerance) {
-            return false;
+        } else if self.compare_hashes_with_non_zero_tolerance(&all_hashed_images, &mut collected_similar_images, progress_sender, stop_receiver, tolerance)
+            == WorkContinueStatus::Stop
+        {
+            return WorkContinueStatus::Stop;
         }
 
         self.verify_duplicated_items(&collected_similar_images);
@@ -675,18 +633,17 @@ impl SimilarImages {
         self.images_to_check = Default::default();
         self.bktree = BKTree::new(Hamming);
 
-        true
+        WorkContinueStatus::Continue
     }
 
     #[fun_time(message = "exclude_items_with_same_size", level = "debug")]
     fn exclude_items_with_same_size(&mut self) {
-        if self.exclude_images_with_same_size {
+        if self.get_params().exclude_images_with_same_size {
             for vec_file_entry in mem::take(&mut self.similar_vectors) {
                 let mut bt_sizes: BTreeSet<u64> = Default::default();
                 let mut vec_values = Vec::new();
                 for file_entry in vec_file_entry {
-                    if !bt_sizes.contains(&file_entry.size) {
-                        bt_sizes.insert(file_entry.size);
+                    if bt_sizes.insert(file_entry.size) {
                         vec_values.push(file_entry);
                     }
                 }
@@ -707,10 +664,10 @@ impl SimilarImages {
                         .into_iter()
                         .partition(|e| self.common_data.directories.is_in_referenced_directory(e.get_path()));
 
-                    if files_from_referenced_folders.is_empty() || normal_files.is_empty() {
+                    if normal_files.is_empty() {
                         None
                     } else {
-                        Some((files_from_referenced_folders.pop().unwrap(), normal_files))
+                        files_from_referenced_folders.pop().map(|file| (file, normal_files))
                     }
                 })
                 .collect::<Vec<(ImagesEntry, Vec<ImagesEntry>)>>();
@@ -765,12 +722,6 @@ fn is_in_reference_folder(reference_directories: &[PathBuf], path: &Path) -> boo
     reference_directories.iter().any(|e| path.starts_with(e))
 }
 
-impl Default for SimilarImages {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DebugPrint for SimilarImages {
     fn debug_print(&self) {
         if !cfg!(debug_assertions) {
@@ -793,12 +744,12 @@ impl PrintResults for SimilarImages {
                 for file_entry in struct_similar {
                     writeln!(
                         writer,
-                        "{:?} - {}x{} - {} - {}",
-                        file_entry.path,
+                        "\"{}\" - {}x{} - {} - {}",
+                        file_entry.path.to_string_lossy(),
                         file_entry.width,
                         file_entry.height,
                         format_size(file_entry.size, BINARY),
-                        get_string_from_similarity(&file_entry.similarity, self.hash_size)
+                        get_string_from_similarity(&file_entry.similarity, self.get_params().hash_size)
                     )?;
                 }
                 writeln!(writer)?;
@@ -811,12 +762,12 @@ impl PrintResults for SimilarImages {
                 writeln!(writer)?;
                 writeln!(
                     writer,
-                    "{:?} - {}x{} - {} - {}",
-                    file_entry.path,
+                    "\"{}\" - {}x{} - {} - {}",
+                    file_entry.path.to_string_lossy(),
                     file_entry.width,
                     file_entry.height,
                     format_size(file_entry.size, BINARY),
-                    get_string_from_similarity(&file_entry.similarity, self.hash_size)
+                    get_string_from_similarity(&file_entry.similarity, self.get_params().hash_size)
                 )?;
                 for file_entry in vec_file_entry {
                     writeln!(
@@ -826,7 +777,7 @@ impl PrintResults for SimilarImages {
                         file_entry.width,
                         file_entry.height,
                         format_size(file_entry.size, BINARY),
-                        get_string_from_similarity(&file_entry.similarity, self.hash_size)
+                        get_string_from_similarity(&file_entry.similarity, self.get_params().hash_size)
                     )?;
                 }
                 writeln!(writer)?;
@@ -871,7 +822,7 @@ pub fn get_string_from_similarity(similarity: &u32, hash_size: u8) -> String {
     } else if *similarity <= SIMILAR_VALUES[index_preset][5] {
         flc!("core_similarity_minimal")
     } else {
-        panic!();
+        panic!("Invalid similarity value {similarity} for hash size {hash_size} (index {index_preset})");
     }
 }
 
@@ -913,6 +864,7 @@ pub fn convert_algorithm_to_string(hash_alg: &HashAlg) -> String {
         HashAlg::Blockhash => "Blockhash",
         HashAlg::VertGradient => "VertGradient",
         HashAlg::DoubleGradient => "DoubleGradient",
+        HashAlg::Median => "Median",
     }
     .to_string()
 }
@@ -922,7 +874,14 @@ pub fn test_image_conversion_speed() {
     let file_path = Path::new(file_name);
     match image::open(file_path) {
         Ok(img_open) => {
-            for alg in [HashAlg::Blockhash, HashAlg::Gradient, HashAlg::DoubleGradient, HashAlg::VertGradient, HashAlg::Mean] {
+            for alg in [
+                HashAlg::Blockhash,
+                HashAlg::Gradient,
+                HashAlg::DoubleGradient,
+                HashAlg::VertGradient,
+                HashAlg::Mean,
+                HashAlg::Median,
+            ] {
                 for filter in [
                     FilterType::Lanczos3,
                     FilterType::CatmullRom,
@@ -933,14 +892,12 @@ pub fn test_image_conversion_speed() {
                     for size in [8, 16, 32, 64] {
                         let hasher_config = HasherConfig::new().hash_alg(alg).resize_filter(filter).hash_size(size, size);
 
-                        let start = SystemTime::now();
+                        let start = Instant::now();
 
                         let hasher = hasher_config.to_hasher();
                         let _hash = hasher.hash_image(&img_open);
 
-                        let end = SystemTime::now();
-
-                        println!("{:?} us {:?} {:?} {}x{}", end.duration_since(start).unwrap().as_micros(), alg, filter, size, size);
+                        println!("{:?} us {:?} {:?} {}x{}", start.elapsed().as_micros(), alg, filter, size, size);
                     }
                 }
             }
@@ -1030,25 +987,8 @@ impl CommonData for SimilarImages {
 }
 
 impl SimilarImages {
-    pub fn set_hash_size(&mut self, hash_size: u8) {
-        self.hash_size = match hash_size {
-            8 | 16 | 32 | 64 => hash_size,
-            e => {
-                panic!("Invalid value of hash size {e}");
-            }
-        }
-    }
-
-    pub fn set_exclude_images_with_same_size(&mut self, exclude_images_with_same_size: bool) {
-        self.exclude_images_with_same_size = exclude_images_with_same_size;
-    }
-
-    pub fn set_hash_alg(&mut self, hash_alg: HashAlg) {
-        self.hash_alg = hash_alg;
-    }
-
-    pub fn set_image_filter(&mut self, image_filter: FilterType) {
-        self.image_filter = image_filter;
+    pub fn get_params(&self) -> &SimilarImagesParameters {
+        &self.params
     }
 
     pub const fn get_similar_images(&self) -> &Vec<Vec<ImagesEntry>> {
@@ -1066,14 +1006,6 @@ impl SimilarImages {
     pub const fn get_information(&self) -> &Info {
         &self.information
     }
-
-    pub fn set_similarity(&mut self, similarity: u32) {
-        self.similarity = similarity;
-    }
-
-    pub fn set_ignore_hard_links(&mut self, ignore_hard_links: bool) {
-        self.ignore_hard_links = ignore_hard_links;
-    }
 }
 
 #[cfg(test)]
@@ -1082,16 +1014,27 @@ mod tests {
     use std::path::PathBuf;
 
     use bk_tree::BKTree;
+    use image::imageops::FilterType;
+    use image_hasher::HashAlg;
 
-    use crate::common_dir_traversal::ToolType;
-    use crate::common_directory::Directories;
-    use crate::common_tool::CommonToolData;
-    use crate::similar_images::{Hamming, ImHash, ImageType, ImagesEntry, SimilarImages};
+    use crate::common_tool::CommonData;
+    use crate::similar_images::{Hamming, ImHash, ImagesEntry, SimilarImages, SimilarImagesParameters};
+
+    fn get_default_parameters() -> SimilarImagesParameters {
+        SimilarImagesParameters {
+            hash_alg: HashAlg::Gradient,
+            hash_size: 8,
+            similarity: 0,
+            image_filter: FilterType::Lanczos3,
+            exclude_images_with_same_size: false,
+            ignore_hard_links: false,
+        }
+    }
 
     #[test]
     fn test_compare_no_images() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages::default();
+            let mut similar_images = SimilarImages::new(get_default_parameters());
             similar_images.find_similar_images(None, None);
             assert_eq!(similar_images.get_similar_images().len(), 0);
         }
@@ -1100,14 +1043,9 @@ mod tests {
     #[test]
     fn test_compare_tolerance_0_normal_mode() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 0,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 0;
+            let mut similar_images = SimilarImages::new(parameters);
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "bcd.txt");
@@ -1135,14 +1073,9 @@ mod tests {
     #[test]
     fn test_simple_normal_one_group() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 1,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 1;
+            let mut similar_images = SimilarImages::new(parameters);
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "bcd.txt");
@@ -1157,15 +1090,10 @@ mod tests {
     #[test]
     fn test_simple_normal_one_group_extended() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 2,
-                common_data: CommonToolData {
-                    use_reference_folders: false,
-                    tool_type: ToolType::SimilarImages,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 2;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(false);
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "bcd.txt");
@@ -1182,19 +1110,12 @@ mod tests {
     #[test]
     fn test_simple_referenced_same_group() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 0,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    directories: Directories {
-                        reference_directories: vec![PathBuf::from("/home/rr/")],
-                        ..Default::default()
-                    },
-                    use_reference_folders: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 0;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(true);
+            // Not using special method, because it validates if path exists
+            similar_images.common_data.directories.reference_directories = vec![PathBuf::from("/home/rr/")];
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "/home/rr/abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "/home/rr/bcd.txt");
@@ -1209,19 +1130,12 @@ mod tests {
     #[test]
     fn test_simple_referenced_group_extended() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 0,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    directories: Directories {
-                        reference_directories: vec![PathBuf::from("/home/rr/")],
-                        ..Default::default()
-                    },
-                    use_reference_folders: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 0;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(true);
+            // Not using special method, because it validates if path exists
+            similar_images.common_data.directories.reference_directories = vec![PathBuf::from("/home/rr/")];
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "/home/rr/abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "/home/kk/bcd.txt");
@@ -1237,19 +1151,12 @@ mod tests {
     #[test]
     fn test_simple_referenced_group_extended2() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 0,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    directories: Directories {
-                        reference_directories: vec![PathBuf::from("/home/rr/")],
-                        ..Default::default()
-                    },
-                    use_reference_folders: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 0;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(true);
+            // Not using special method, because it validates if path exists
+            similar_images.common_data.directories.reference_directories = vec![PathBuf::from("/home/rr/")];
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "/home/rr/abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "/home/rr/abc2.txt");
@@ -1269,15 +1176,10 @@ mod tests {
     #[test]
     fn test_simple_normal_too_small_similarity() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 1,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    use_reference_folders: false,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 1;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(false);
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b00001], "abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b00100], "bcd.txt");
@@ -1294,15 +1196,10 @@ mod tests {
     #[test]
     fn test_simple_normal_union_of_similarity() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 4,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    use_reference_folders: false,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 4;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(false);
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b0000_0001], "abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b0000_1111], "bcd.txt");
@@ -1328,19 +1225,12 @@ mod tests {
     #[test]
     fn test_reference_similarity_only_one() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 1,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    directories: Directories {
-                        reference_directories: vec![PathBuf::from("/home/rr/")],
-                        ..Default::default()
-                    },
-                    use_reference_folders: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 1;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(true);
+            // Not using special method, because it validates if path exists
+            similar_images.common_data.directories.reference_directories = vec![PathBuf::from("/home/rr/")];
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b0001], "/home/rr/abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b0011], "/home/kk/bcd.txt");
@@ -1359,19 +1249,12 @@ mod tests {
     #[test]
     fn test_reference_too_small_similarity() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 1,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    directories: Directories {
-                        reference_directories: vec![PathBuf::from("/home/rr/")],
-                        ..Default::default()
-                    },
-                    use_reference_folders: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 1;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(true);
+            // Not using special method, because it validates if path exists
+            similar_images.common_data.directories.reference_directories = vec![PathBuf::from("/home/rr/")];
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b0001], "/home/rr/abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b0010], "/home/kk/bcd.txt");
@@ -1387,19 +1270,12 @@ mod tests {
     #[test]
     fn test_reference_minimal() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 1,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    directories: Directories {
-                        reference_directories: vec![PathBuf::from("/home/rr/")],
-                        ..Default::default()
-                    },
-                    use_reference_folders: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 1;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(true);
+            // Not using special method, because it validates if path exists
+            similar_images.common_data.directories.reference_directories = vec![PathBuf::from("/home/rr/")];
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b0001], "/home/rr/abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b0011], "/home/kk/bcd.txt");
@@ -1426,19 +1302,12 @@ mod tests {
     #[test]
     fn test_reference_same() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 1,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    directories: Directories {
-                        reference_directories: vec![PathBuf::from("/home/rr/")],
-                        ..Default::default()
-                    },
-                    use_reference_folders: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 1;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(true);
+            // Not using special method, because it validates if path exists
+            similar_images.common_data.directories.reference_directories = vec![PathBuf::from("/home/rr/")];
 
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "/home/rr/abc.txt");
             let fe2 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 1], "/home/kk/bcd.txt");
@@ -1455,19 +1324,12 @@ mod tests {
     #[test]
     fn test_reference_union() {
         for _ in 0..100 {
-            let mut similar_images = SimilarImages {
-                similarity: 10,
-                common_data: CommonToolData {
-                    tool_type: ToolType::SimilarImages,
-                    directories: Directories {
-                        reference_directories: vec![PathBuf::from("/home/rr/")],
-                        ..Default::default()
-                    },
-                    use_reference_folders: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut parameters = get_default_parameters();
+            parameters.similarity = 10;
+            let mut similar_images = SimilarImages::new(parameters);
+            similar_images.set_use_reference_folders(true);
+            // Not using special method, because it validates if path exists
+            similar_images.common_data.directories.reference_directories = vec![PathBuf::from("/home/rr/")];
 
             let fe0 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b1000], "/home/rr/abc2.txt");
             let fe1 = create_random_file_entry(vec![1, 1, 1, 1, 1, 1, 1, 0b0001], "/home/rr/abc.txt");
@@ -1495,21 +1357,21 @@ mod tests {
         let fe2 = vec![1, 1, 1, 1, 1, 1, 1, 2];
         let mut bktree = BKTree::new(Hamming);
         bktree.add(fe1);
-        let (similarity, _hash) = bktree.find(&fe2, 100).next().unwrap();
+        let (similarity, _hash) = bktree.find(&fe2, 100).next().expect("No similar images found");
         assert_eq!(similarity, 2);
 
         let fe1 = vec![1, 1, 1, 1, 1, 1, 1, 1];
         let fe2 = vec![1, 1, 1, 1, 1, 1, 1, 3];
         let mut bktree = BKTree::new(Hamming);
         bktree.add(fe1);
-        let (similarity, _hash) = bktree.find(&fe2, 100).next().unwrap();
+        let (similarity, _hash) = bktree.find(&fe2, 100).next().expect("No similar images found");
         assert_eq!(similarity, 1);
 
         let fe1 = vec![1, 1, 1, 1, 1, 1, 1, 0b0000_0000];
         let fe2 = vec![1, 1, 1, 1, 1, 1, 1, 0b0000_1000];
         let mut bktree = BKTree::new(Hamming);
         bktree.add(fe1);
-        let (similarity, _hash) = bktree.find(&fe2, 100).next().unwrap();
+        let (similarity, _hash) = bktree.find(&fe2, 100).next().expect("No similar images found");
         assert_eq!(similarity, 1);
     }
 
@@ -1528,7 +1390,6 @@ mod tests {
             modified_date: 0,
             hash,
             similarity: 0,
-            image_type: ImageType::Normal,
         }
     }
 }

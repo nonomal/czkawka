@@ -5,9 +5,11 @@ use crossbeam_channel::{Receiver, Sender};
 use fun_time::fun_time;
 use log::debug;
 
-use crate::common_dir_traversal::{DirTraversalBuilder, DirTraversalResult, FileEntry, ProgressData, ToolType};
+use crate::common::WorkContinueStatus;
+use crate::common_dir_traversal::{DirTraversalBuilder, DirTraversalResult, FileEntry, ToolType};
 use crate::common_tool::{CommonData, CommonToolData, DeleteMethod};
 use crate::common_traits::*;
+use crate::progress_data::ProgressData;
 
 #[derive(Default)]
 pub struct Info {
@@ -41,7 +43,7 @@ impl EmptyFiles {
     #[fun_time(message = "find_empty_files", level = "info")]
     pub fn find_empty_files(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) {
         self.prepare_items();
-        if !self.check_files(stop_receiver, progress_sender) {
+        if self.check_files(stop_receiver, progress_sender) == WorkContinueStatus::Stop {
             self.common_data.stopped_search = true;
             return;
         }
@@ -50,7 +52,7 @@ impl EmptyFiles {
     }
 
     #[fun_time(message = "check_files", level = "debug")]
-    fn check_files(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> bool {
+    fn check_files(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> WorkContinueStatus {
         let result = DirTraversalBuilder::new()
             .common_data(&self.common_data)
             .group_by(|_fe| ())
@@ -69,10 +71,10 @@ impl EmptyFiles {
 
                 debug!("Found {} empty files.", self.information.number_of_empty_files);
 
-                true
+                WorkContinueStatus::Continue
             }
 
-            DirTraversalResult::Stopped => false,
+            DirTraversalResult::Stopped => WorkContinueStatus::Stop,
         }
     }
 
@@ -127,7 +129,7 @@ impl PrintResults for EmptyFiles {
         if !self.empty_files.is_empty() {
             writeln!(writer, "Found {} empty files.", self.information.number_of_empty_files)?;
             for file_entry in &self.empty_files {
-                writeln!(writer, "{:?}", file_entry.path)?;
+                writeln!(writer, "\"{}\"", file_entry.path.to_string_lossy())?;
             }
         } else {
             write!(writer, "Not found any empty files.")?;

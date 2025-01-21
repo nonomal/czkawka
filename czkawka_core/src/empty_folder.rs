@@ -10,12 +10,13 @@ use fun_time::fun_time;
 use log::debug;
 use rayon::prelude::*;
 
-use crate::common::{check_if_stop_received, prepare_thread_handler_common, send_info_and_wait_for_ending_all_threads};
-use crate::common_dir_traversal::{common_get_entry_data, common_get_metadata_dir, common_read_dir, get_modified_time, CheckingMethod, ProgressData, ToolType};
+use crate::common::{check_if_stop_received, prepare_thread_handler_common, send_info_and_wait_for_ending_all_threads, WorkContinueStatus};
+use crate::common_dir_traversal::{common_get_entry_data, common_get_metadata_dir, common_read_dir, get_modified_time, ToolType};
 use crate::common_directory::Directories;
 use crate::common_items::ExcludedItems;
 use crate::common_tool::{CommonData, CommonToolData, DeleteMethod};
 use crate::common_traits::{DebugPrint, PrintResults};
+use crate::progress_data::{CurrentStage, ProgressData};
 
 #[derive(Clone, Debug)]
 pub struct FolderEntry {
@@ -71,7 +72,7 @@ impl EmptyFolder {
     #[fun_time(message = "find_empty_folders", level = "info")]
     pub fn find_empty_folders(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) {
         self.prepare_items();
-        if !self.check_for_empty_folders(stop_receiver, progress_sender) {
+        if self.check_for_empty_folders(stop_receiver, progress_sender) == WorkContinueStatus::Stop {
             self.common_data.stopped_search = true;
             return;
         }
@@ -101,11 +102,11 @@ impl EmptyFolder {
     }
 
     #[fun_time(message = "check_for_empty_folders", level = "debug")]
-    fn check_for_empty_folders(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> bool {
+    fn check_for_empty_folders(&mut self, stop_receiver: Option<&Receiver<()>>, progress_sender: Option<&Sender<ProgressData>>) -> WorkContinueStatus {
         let mut folders_to_check: Vec<PathBuf> = self.common_data.directories.included_directories.clone();
 
         let (progress_thread_handle, progress_thread_run, atomic_counter, _check_was_stopped) =
-            prepare_thread_handler_common(progress_sender, 0, 0, 0, CheckingMethod::None, self.common_data.tool_type);
+            prepare_thread_handler_common(progress_sender, CurrentStage::CollectingFiles, 0, self.get_test_type());
 
         let excluded_items = self.common_data.excluded_items.clone();
         let directories = self.common_data.directories.clone();
@@ -126,7 +127,7 @@ impl EmptyFolder {
         while !folders_to_check.is_empty() {
             if check_if_stop_received(stop_receiver) {
                 send_info_and_wait_for_ending_all_threads(&progress_thread_run, progress_thread_handle);
-                return false;
+                return WorkContinueStatus::Stop;
             }
 
             let segments: Vec<_> = folders_to_check
@@ -218,11 +219,13 @@ impl EmptyFolder {
 
         debug!("Found {} empty folders.", self.empty_folder_list.len());
         send_info_and_wait_for_ending_all_threads(&progress_thread_run, progress_thread_handle);
-        true
+        WorkContinueStatus::Continue
     }
 
     pub(crate) fn set_as_not_empty_folder(folder_entries: &mut HashMap<String, FolderEntry>, current_folder: &str) {
-        let mut d = folder_entries.get_mut(current_folder).unwrap();
+        let mut d = folder_entries
+            .get_mut(current_folder)
+            .unwrap_or_else(|| panic!("Folder {current_folder} not found in folder_entries"));
         if d.is_empty == FolderEmptiness::No {
             return; // Already set as non empty by one of his child
         }
@@ -230,9 +233,10 @@ impl EmptyFolder {
         // Loop to recursively set as non empty this and all his parent folders
         loop {
             d.is_empty = FolderEmptiness::No;
-            if d.parent_path.is_some() {
-                let cf = d.parent_path.clone().unwrap();
-                d = folder_entries.get_mut(&cf).unwrap();
+
+            if let Some(parent_path) = &d.parent_path {
+                let cf = parent_path.clone();
+                d = folder_entries.get_mut(&cf).unwrap_or_else(|| panic!("Folder {cf} not found in folder_entries"));
                 if d.is_empty == FolderEmptiness::No {
                     break; // Already set as non empty, so one of child already set it to non empty
                 }

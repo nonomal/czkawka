@@ -1,9 +1,8 @@
+use czkawka_core::common::regex_check;
+use czkawka_core::common_items::new_excluded_item;
 use gtk4::prelude::*;
 use gtk4::{ResponseType, TreeIter, Window};
 use regex::Regex;
-
-use czkawka_core::common::regex_check;
-use czkawka_core::common_items::new_excluded_item;
 
 use crate::flg;
 use crate::gui_structs::gui_data::GuiData;
@@ -134,11 +133,11 @@ fn popover_all_except_oldest_newest(
                     break;
                 }
             }
-            if used_index.is_none() {
+            let Some(used_index) = used_index else {
                 continue;
-            }
+            };
             for (index, tree_iter) in tree_iter_array.iter().enumerate() {
-                if index != used_index.unwrap() {
+                if index != used_index {
                     model.set_value(tree_iter, column_button_selection, &true.to_value());
                 } else {
                     model.set_value(tree_iter, column_button_selection, &false.to_value());
@@ -206,11 +205,12 @@ fn popover_one_oldest_newest(
                     break;
                 }
             }
-            if used_index.is_none() {
+            let Some(used_index) = used_index else {
                 continue;
-            }
+            };
+
             for (index, tree_iter) in tree_iter_array.iter().enumerate() {
-                if index == used_index.unwrap() {
+                if index == used_index {
                     model.set_value(tree_iter, column_button_selection, &true.to_value());
                 } else {
                     model.set_value(tree_iter, column_button_selection, &false.to_value());
@@ -393,7 +393,9 @@ fn popover_custom_select_unselect(
                             return;
                         }
                     } else {
-                        Regex::new("").unwrap()
+                        // Trivial regex is used, because I need here regex
+                        #[allow(clippy::trivial_regex)]
+                        Regex::new("").expect("Empty regex should compile properly.")
                     };
 
                     let model = get_list_store(&tree_view);
@@ -577,11 +579,11 @@ fn popover_all_except_biggest_smallest(
                     break;
                 }
             }
-            if used_index.is_none() {
+            let Some(used_index) = used_index else {
                 continue;
-            }
+            };
             for (index, tree_iter) in tree_iter_array.iter().enumerate() {
-                if index != used_index.unwrap() {
+                if index != used_index {
                     model.set_value(tree_iter, column_button_selection, &true.to_value());
                 } else {
                     model.set_value(tree_iter, column_button_selection, &false.to_value());
@@ -604,7 +606,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
 
     buttons_popover_select_all.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 
@@ -616,7 +618,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let notebook_main = gui_data.main_notebook.notebook_main.clone();
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
     buttons_popover_unselect_all.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 
@@ -628,7 +630,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let notebook_main = gui_data.main_notebook.notebook_main.clone();
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
     buttons_popover_reverse.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 
@@ -640,7 +642,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let notebook_main = gui_data.main_notebook.notebook_main.clone();
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
     buttons_popover_select_all_except_oldest.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 
@@ -660,7 +662,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let notebook_main = gui_data.main_notebook.notebook_main.clone();
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
     buttons_popover_select_all_except_newest.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 
@@ -680,7 +682,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let notebook_main = gui_data.main_notebook.notebook_main.clone();
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
     buttons_popover_select_one_oldest.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 
@@ -700,7 +702,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let notebook_main = gui_data.main_notebook.notebook_main.clone();
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
     buttons_popover_select_one_newest.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 
@@ -721,7 +723,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
     let window_main = gui_data.window_main.clone();
     buttons_popover_select_custom.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 
@@ -743,7 +745,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
     let window_main = gui_data.window_main.clone();
     buttons_popover_unselect_custom.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 
@@ -764,7 +766,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let notebook_main = gui_data.main_notebook.notebook_main.clone();
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
     buttons_popover_select_all_images_except_biggest.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 
@@ -784,7 +786,7 @@ pub fn connect_popover_select(gui_data: &GuiData) {
     let notebook_main = gui_data.main_notebook.notebook_main.clone();
     let main_tree_views = gui_data.main_notebook.get_main_tree_views();
     buttons_popover_select_all_images_except_smallest.connect_clicked(move |_| {
-        let nb_number = notebook_main.current_page().unwrap();
+        let nb_number = notebook_main.current_page().expect("Current page not set");
         let tree_view = &main_tree_views[nb_number as usize];
         let nb_object = &NOTEBOOKS_INFO[nb_number as usize];
 

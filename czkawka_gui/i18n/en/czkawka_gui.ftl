@@ -21,6 +21,12 @@ music_checking_by_content = Content
 same_music_seconds_label = Minimal fragment second duration
 same_music_similarity_label = Maximum difference
 
+music_compare_only_in_title_group = Compare only in title
+music_compare_only_in_title_group_tooltip =
+        When enabled, files are grouped by title and then compared to each other.
+
+        With 10000 files, instead almost 100 million comparisons usually there will be around 20000 comparisons.
+
 same_music_tooltip =
         Searching for similar music files by its content can be configured by setting:
 
@@ -280,6 +286,7 @@ bottom_symlink_button = Symlink
 bottom_hardlink_button = Hardlink
 bottom_move_button = Move
 bottom_sort_button = Sort
+bottom_compare_button = Compare
 
 bottom_search_button_tooltip = Start search
 bottom_select_button_tooltip = Select records. Only selected files/folders can be later processed.
@@ -304,6 +311,8 @@ bottom_move_button_tooltip =
         When trying to move two files with identical name to folder, second will fail and show error.
 bottom_sort_button_tooltip =
         Sorts files/folders according to selected method.
+bottom_compare_button_tooltip =
+        Compare images in the group.
 
 bottom_show_errors_tooltip = Show/Hide bottom text panel.
 bottom_show_upper_notebook_tooltip = Show/Hide upper notebook panel.
@@ -331,6 +340,14 @@ header_about_button_tooltip = Opens dialog with info about app.
 ## General
 settings_number_of_threads = Number of used threads
 settings_number_of_threads_tooltip = Number of used threads, 0 means that all available threads will be used.
+
+settings_use_rust_preview = Use external libraries instead gtk to load previews
+settings_use_rust_preview_tooltip =
+        Using gtk previews will sometimes be faster and support more formats, but sometimes this could be exactly the opposite.
+
+        If you have problems with loading previews, you may can to try to change this setting.
+
+        On non-linux systems, it is recommended to use this option, because gtk-pixbuf are not always available there so disabling this option will not load previews of some images.
 
 settings_label_restart = You need to restart app to apply settings!
 
@@ -460,7 +477,10 @@ compute_found_broken_files = Found { $number_files } broken files
 compute_found_bad_extensions = Found { $number_files } files with invalid extensions
 
 # Progress window
-progress_scanning_general_file = Scanning {$file_number} file
+progress_scanning_general_file = {$file_number -> 
+        [one] Scanning {$file_number} file
+       *[other] Scanning {$file_number} files
+}
 
 progress_scanning_extension_of_files = Checking extension of {$file_checked}/{$all_files} file
 progress_scanning_broken_files = Checking {$file_checked}/{$all_files} file
@@ -471,7 +491,10 @@ progress_scanning_music_tags_end = Comparing tags of {$file_checked}/{$all_files
 progress_scanning_music_tags = Reading tags of {$file_checked}/{$all_files} music file
 progress_scanning_music_content_end = Comparing fingerprint of {$file_checked}/{$all_files} music file
 progress_scanning_music_content = Calculating fingerprint of {$file_checked}/{$all_files} music file
-progress_scanning_empty_folders = Scanning {$folder_number} folder
+progress_scanning_empty_folders = {$folder_number -> 
+        [one] Scanning {$folder_number} folder
+       *[other] Scanning {$folder_number} folders
+}
 progress_scanning_size = Scanning size of {$file_number} file
 progress_scanning_size_name = Scanning name and size of {$file_number} file
 progress_scanning_name = Scanning name of {$file_number} file
